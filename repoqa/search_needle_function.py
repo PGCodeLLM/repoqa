@@ -386,6 +386,7 @@ def evaluate_model(
     eval_ignore_comments: bool = False,  # ignore comments during score computation
     trust_remote_code: bool = False,
     attn_implementation=None,
+    task_type: str = "needle_search",
 ):
     if backend is None:
         if base_url is not None:
@@ -400,6 +401,12 @@ def evaluate_model(
             dataset = json.load(f)
     else:
         dataset = get_repoqa_data()
+
+    allowed_task_types = ["needle_search", "echo_signature", "find_file"]
+    if task_type not in allowed_task_types:
+        raise ValueError(
+            f"Invalid task_type '{task_type}'. Allowed values: {allowed_task_types}"
+        )
 
     # makedir if not exists
     os.makedirs(result_dir, exist_ok=True)
