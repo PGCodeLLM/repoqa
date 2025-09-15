@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from tree_sitter_languages import get_parser
+
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -88,3 +90,57 @@ def progress(note: str = "processing"):
         TextColumn("•"),
         TimeElapsedColumn(),
     )
+
+
+def extract_function_signature(language: str, file_content: str, start_byte: int, end_byte: int) -> str:
+    """
+    Extracts the function signature from file_content between start_byte and end_byte using Tree-sitter.
+    Supports: python, java, typescript, rust, cpp, go.
+    """
+    parser = get_parser(language)
+    source_bytes = bytes(file_content, "utf8")
+    tree = parser.parse(source_bytes)
+    root = tree.root_node
+
+    # Language-specific node types for function definitions
+    node_types = {
+        "python": ["function_definition", "async_function_definition"],
+        "java": ["method_declaration", "constructor_declaration"],
+        "typescript": ["function_declaration", "method_definition"],
+        "rust": ["function_item"],
+        "cpp": ["function_definition"],
+        "go": ["function_declaration", "method_declaration"],
+    }
+    types = node_types.get(language, [])
+
+    def is_within(node):
+        # Allow some tolerance for whitespace/comments
+        return node.start_byte <= start_byte and node.end_byte >= end_byte
+
+    def find_signature_node(node):
+        if node.type in types and is_within(node):
+            return node
+        for child in node.children:
+            result = find_signature_node(child)
+            if result:
+                return result
+        return None
+
+    func_node = find_signature_node(root)
+    if not func_node:
+        return ""
+
+    # Find the first child that starts the function body (':' for Python, '{' for others)
+    sig_end = func_node.end_byte  # fallback
+    for child in func_node.children:
+        # For Python, function body starts with ':'
+        if language == "python" and child.type == ":":
+            sig_end = child.end_byte
+            break
+        # For other languages, function body starts with '{'
+        if language != "python" and child.type == "{":
+            sig_end = child.start_byte
+            break
+
+    sig_text = source_bytes[func_node.start_byte:sig_end].decode("utf8")
+    return sig_text.strip()
