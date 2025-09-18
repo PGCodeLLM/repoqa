@@ -37,6 +37,13 @@ ECHO_SIGNATURE_INSTRUCTION = (
 
 ECHO_SIGNATURE_TEMPLATE = "instruction\nname\ncode_context\ninstruction\nname"
 
+FIND_FILE_INSTRUCTION = (
+    "Based on the function description and code context,"
+    " output the file path where the following function is defined, without any additional text or explanation."
+)
+
+FIND_FILE_TEMPLATE = "instruction\nname\ncode_context\ninstruction\nname"
+
 # Mode to clean context comments
 class CleanComment(Enum):
     NoClean = "none"
@@ -621,17 +628,25 @@ def evaluate_model(
                     prompt = (
                         ECHO_SIGNATURE_INSTRUCTION
                         + "\n"
-                        + task["name"]
+                        + f"Function name: {task['name']}"
                         + "\n"
                         + task["code_context"]
                         + "\n"
                         + ECHO_SIGNATURE_INSTRUCTION
                         + "\n"
-                        + task["name"]
+                        + f"Function name: {task['name']}"
                     )
                 elif task_type == "find_file":
-                    raise NotImplementedError(
-                        "Find file task is not implemented yet."
+                    prompt = (
+                        FIND_FILE_INSTRUCTION
+                        + "\n"
+                        + f"Function name: {task['name']}"
+                        + "\n"
+                        + task["code_context"]
+                        + "\n"
+                        + FIND_FILE_INSTRUCTION
+                        + "\n"
+                        + f"Function name: {task['name']}"
                     )
                 else:
                     raise ValueError(f"Unknown task type: {task_type}")
@@ -640,6 +655,8 @@ def evaluate_model(
                     prompt, n=1, max_tokens=max_new_tokens, system_msg=system_message
                 )
                 result = {**task, "output": replies, "task_type": task_type}
+                # if task_type == "find_file":
+                #     result["ground_truth_path"] = task["path"]
                 f_out.write(json.dumps(result) + "\n")
                 f_out.flush()
                 model_outputs.append(result)

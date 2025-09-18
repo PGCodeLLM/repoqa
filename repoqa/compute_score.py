@@ -170,6 +170,13 @@ def needle_evaluator(
             return Result.BEST_MATCH, ground_truth, similarity
         else:
             return Result.FAIL_MATCH, ground_truth, similarity
+    if task_type == "find_file":
+        # Normalize whitespace and compare
+        output_path = sanitize_output(model_output, lang).strip()
+        if output_path == ground_truth:
+            return Result.BEST_MATCH, ground_truth, 1.0
+        else:
+            return Result.FAIL_MATCH, ground_truth, 0.0
 
     best_target = None
     best_similarity = 0
@@ -275,7 +282,9 @@ def compute_score(
             repo_name = result["repo"]
             model_outputs = result["output"]
             task_type = result.get("task_type", "needle_search")
-            if task_type == "echo_signature":
+            if task_type == "find_file":
+                ground_truth = result["path"]
+            elif task_type == "echo_signature":
                 ground_truth = result["signature"]
             else:
                 ground_truth = result["name"]
