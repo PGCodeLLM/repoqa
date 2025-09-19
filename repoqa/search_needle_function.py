@@ -284,6 +284,7 @@ def make_code_context(
     language: str,
     clean_comments: CleanComment = CleanComment.NoClean,
     context_type: str = "body",
+    repo_name: str = "unknown",
 ) -> str:
     """
     Slice the file_content_list such that:
@@ -368,6 +369,32 @@ def make_code_context(
     else:
         # Extract needle code from original content for other task types
         needle_code = needle_file_content[needle["start_byte"] : needle["end_byte"]]
+    
+    # Check if all files fit in context window and warn if not
+    total_tokens = 0
+    for path, content in file_content_list:
+        # Add tokens for path header
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        total_tokens += len(tokenizer.tokenize(path_header))
+        
+        # Add tokens for file content (respecting context_type)
+        if context_type == "signature":
+            content_to_tokenize = extract_all_function_signatures(language, content)
+        else:
+            content_to_tokenize = content
+        
+        total_tokens += len(tokenizer.tokenize(content_to_tokenize))
+    
+    # Warn if total exceeds context size
+    if total_tokens > code_context_size:
+        needle_info = f"Function: {needle.get('name', 'unknown')} in {needle.get('path', 'unknown file')}"
+        task_info = f"Repo: {repo_name}"
+        print(f"⚠️  Warning: {needle_info} ({task_info})")
+        print(f"   All files contain {total_tokens} tokens, exceeding context size of {code_context_size}.")
+        print(f"   Some files may be truncated in the final context.")
+        if context_type == "body":
+            print(f"   Consider using --context_type signature to reduce token usage.")
+
     ntoken_needle = len(tokenizer.tokenize(needle_code))
 
     # Used for if cleaning comments option is enabled (paths comments are skipped)
@@ -622,6 +649,7 @@ def evaluate_model(
                         language=lang,
                         clean_comments=clean_ctx_comments,
                         context_type=context_type,
+                        repo_name=repo["repo"],
                     )
                     task.update(code_context_info)
                     tasks.append(task)
