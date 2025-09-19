@@ -11,7 +11,7 @@ from tree_sitter_languages import get_language, get_parser
 
 from repoqa.compute_score import compute_score, save_json
 from repoqa.data import CACHE_DIR, get_repoqa_data
-from repoqa.utility import COMMENT_QUERY, progress, topological_sort, extract_function_signature
+from repoqa.utility import COMMENT_QUERY, progress, topological_sort, extract_function_signature, extract_all_function_signatures
 
 COMMENT_PREFIX = {
     "python": "#",
@@ -283,6 +283,7 @@ def make_code_context(
     code_context_size: int,
     language: str,
     clean_comments: CleanComment = CleanComment.NoClean,
+    context_type: str = "body",
 ) -> str:
     """
     Slice the file_content_list such that:
@@ -291,16 +292,82 @@ def make_code_context(
     *May not be achievable if the needle is too close to the beginning or end of the file_content_list
     *May not be accurate as we will also insert file names at the beginning of each file
     *Token sizes might not be 100 accurate but should be close enough
+    
+    If context_type is "signature", uses function signatures instead of full file content.
+    If context_type is "body" (default), uses full file content.
     """
     tokenizer = AutoTokenizer.from_pretrained("codellama/CodeLlama-7b-Instruct-hf")
 
+    # Keep original file content list for needle extraction
+    original_file_content_list = file_content_list
+
     needle_file_idx, needle_file_content = [
         (i, content)
-        for i, (f, content) in enumerate(file_content_list)
+        for i, (f, content) in enumerate(original_file_content_list)
         if f == needle["path"]
     ][0]
 
-    needle_code = needle_file_content[needle["start_byte"] : needle["end_byte"]]
+    # For signature context type, convert file contents to function signatures and extract needle as signature
+    if context_type == "signature":
+        # First, extract all signatures from the needle file to find the needle function signature
+        all_signatures = extract_all_function_signatures(language, needle_file_content)
+        
+        # Parse the file to find which function contains the needle start_byte
+        parser = get_parser(language)
+        source_bytes = bytes(needle_file_content, "utf8")
+        tree = parser.parse(source_bytes)
+        root = tree.root_node
+        
+        # Language-specific node types for function definitions
+        node_types = {
+            "python": ["function_definition", "async_function_definition"],
+            "java": ["method_declaration", "constructor_declaration"],
+            "typescript": ["function_declaration", "method_definition"],
+            "rust": ["function_item"],
+            "cpp": ["function_definition"],
+            "go": ["function_declaration", "method_declaration"],
+        }
+        types = node_types.get(language, [])
+        
+        def find_containing_function(node):
+            if node.type in types and node.start_byte <= needle["start_byte"] < node.end_byte:
+                return node
+            for child in node.children:
+                result = find_containing_function(child)
+                if result:
+                    return result
+            return None
+        
+        needle_func_node = find_containing_function(root)
+        if needle_func_node:
+            # Extract just the signature part of this function
+            sig_end = needle_func_node.end_byte  # fallback
+            for child in needle_func_node.children:
+                # For Python, function body starts with ':'
+                if language == "python" and child.type == ":":
+                    sig_end = child.end_byte
+                    break
+                # For other languages, function body starts with '{'
+                if language != "python" and child.type == "{":
+                    sig_end = child.start_byte
+                    break
+            needle_code = source_bytes[needle_func_node.start_byte:sig_end].decode("utf8").strip()
+        else:
+            # Fallback to original needle code if we can't find the function
+            needle_code = needle_file_content[needle["start_byte"] : needle["end_byte"]]
+        
+        # Convert all file contents to function signatures
+        processed_file_content_list = []
+        for path, content in original_file_content_list:
+            signatures = extract_all_function_signatures(language, content)
+            processed_file_content_list.append((path, signatures))
+        file_content_list = processed_file_content_list
+        
+        # Update needle_file_content to be the signatures for the needle file
+        needle_file_content = file_content_list[needle_file_idx][1]
+    else:
+        # Extract needle code from original content for other task types
+        needle_code = needle_file_content[needle["start_byte"] : needle["end_byte"]]
     ntoken_needle = len(tokenizer.tokenize(needle_code))
 
     # Used for if cleaning comments option is enabled (paths comments are skipped)
@@ -411,6 +478,7 @@ def evaluate_model(
     trust_remote_code: bool = False,
     attn_implementation=None,
     task_type: str = "needle_search",
+    context_type: str = "body",
 ):
     if backend is None:
         if base_url is not None:
@@ -553,6 +621,7 @@ def evaluate_model(
                         code_context_size=code_context_size,
                         language=lang,
                         clean_comments=clean_ctx_comments,
+                        context_type=context_type,
                     )
                     task.update(code_context_info)
                     tasks.append(task)

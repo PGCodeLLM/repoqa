@@ -144,3 +144,55 @@ def extract_function_signature(language: str, file_content: str, start_byte: int
 
     sig_text = source_bytes[func_node.start_byte:sig_end].decode("utf8")
     return sig_text.strip()
+
+
+def extract_all_function_signatures(language: str, file_content: str) -> str:
+    """
+    Extracts all function signatures from file_content using Tree-sitter.
+    Returns a string containing all function signatures separated by newlines.
+    Supports: python, java, typescript, rust, cpp, go.
+    """
+    parser = get_parser(language)
+    source_bytes = bytes(file_content, "utf8")
+    tree = parser.parse(source_bytes)
+    root = tree.root_node
+
+    # Language-specific node types for function definitions
+    node_types = {
+        "python": ["function_definition", "async_function_definition"],
+        "java": ["method_declaration", "constructor_declaration"],
+        "typescript": ["function_declaration", "method_definition"],
+        "rust": ["function_item"],
+        "cpp": ["function_definition"],
+        "go": ["function_declaration", "method_declaration"],
+    }
+    types = node_types.get(language, [])
+
+    def find_function_nodes(node):
+        functions = []
+        if node.type in types:
+            functions.append(node)
+        for child in node.children:
+            functions.extend(find_function_nodes(child))
+        return functions
+
+    function_nodes = find_function_nodes(root)
+    signatures = []
+
+    for func_node in function_nodes:
+        # Find the first child that starts the function body (':' for Python, '{' for others)
+        sig_end = func_node.end_byte  # fallback
+        for child in func_node.children:
+            # For Python, function body starts with ':'
+            if language == "python" and child.type == ":":
+                sig_end = child.end_byte
+                break
+            # For other languages, function body starts with '{'
+            if language != "python" and child.type == "{":
+                sig_end = child.start_byte
+                break
+
+        sig_text = source_bytes[func_node.start_byte:sig_end].decode("utf8")
+        signatures.append(sig_text.strip())
+
+    return "\n".join(signatures)
