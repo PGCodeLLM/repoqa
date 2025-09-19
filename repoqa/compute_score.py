@@ -173,18 +173,11 @@ def needle_evaluator(
 
     sanitized_output = sanitize_output(model_output, lang)
 
-    if task_type == "echo_signature":
-        similarity = compute_function_similarity(sanitized_output, ground_truth)
+    if task_type in ["echo_signature", "find_file"]:
+        similarity = compute_function_similarity(sanitized_output.strip(), ground_truth)
         # Don't use hard-coded threshold here - let threshold-based scoring handle it
         # Always return BEST_MATCH to indicate we found the target, with actual similarity score
         return Result.BEST_MATCH, ground_truth, similarity
-    if task_type == "find_file":
-        # Normalize whitespace and compare
-        output_path = sanitize_output(model_output, lang).strip()
-        if output_path == ground_truth:
-            return Result.BEST_MATCH, ground_truth, 1.0
-        else:
-            return Result.FAIL_MATCH, ground_truth, 0.0
 
     best_target = None
     best_similarity = 0
