@@ -11,7 +11,7 @@ from tree_sitter_languages import get_language, get_parser
 
 from repoqa.compute_score import compute_score, save_json
 from repoqa.data import CACHE_DIR, get_repoqa_data
-from repoqa.utility import COMMENT_QUERY, progress, topological_sort, extract_function_signature, extract_all_function_signatures
+from repoqa.utility import COMMENT_QUERY, progress, topological_sort, extract_function_signature, extract_all_function_signatures, FUNCTION_QUERY
 
 COMMENT_PREFIX = {
     "python": "#",
@@ -57,6 +57,10 @@ def _backward_tokenizable_lines(lines, tokenizer, max_tokens):
     ntokens = 0
     is_break = False
     is_latest_line = True
+    
+    # For signature context, try to avoid breaking in the middle of function signatures
+    in_function_signature = False
+    
     for line in reversed(lines):
         # if the first processed line is not empty, we do not add a new line after it
         if is_latest_line:
@@ -68,11 +72,32 @@ def _backward_tokenizable_lines(lines, tokenizer, max_tokens):
             NEW_LINE = '\n'
 
         new_ntokens = len(tokenizer.tokenize(line + NEW_LINE))
+        
+        # Check if we're in a function signature (simple heuristic)
+        line_stripped = line.strip()
+        starts_function = (line_stripped.startswith('def ') or 
+                          line_stripped.startswith('class ') or
+                          line_stripped.startswith('async def '))
+        ends_function_sig = line_stripped.endswith(':') and (starts_function or in_function_signature)
+        
+        if starts_function:
+            in_function_signature = True
+        elif ends_function_sig:
+            in_function_signature = False
+        
+        # If adding this line would exceed tokens, check if we should break
         if ntokens + new_ntokens > max_tokens:
-            is_break = True
-            break
+            # If we're in the middle of a function signature, try to include the whole signature
+            if in_function_signature and ntokens < max_tokens * 0.9:  # Allow 10% overflow for signatures
+                # Include this line to complete the signature
+                pass
+            else:
+                is_break = True
+                break
+                
         text = line + NEW_LINE + text
         ntokens += new_ntokens
+        
     return text, ntokens, is_break
 
 
@@ -162,6 +187,293 @@ def clean_partial_file(language, whole_file, partial_lines, path):
         + "\n".join(source_bytes.decode("utf-8").split("\n")[: partial_lines - 1])
         + "...\n"
     )
+
+
+def _extract_functions_from_content(language: str, content: str):
+    """Extract all functions from content with their positions and full text."""
+    parser = get_parser(language)
+    source_bytes = bytes(content, "utf8")
+    tree = parser.parse(source_bytes)
+    
+    # Get function query for this language
+    fn_query = get_language(language).query(FUNCTION_QUERY[language])
+    functions = []
+    
+    for capture in fn_query.captures(tree.root_node):
+        node, _ = capture
+        function_text = source_bytes[node.start_byte:node.end_byte].decode("utf8")
+        
+        # Extract signature (up to first { or :)
+        lines = function_text.split('\n')
+        signature_lines = []
+        body_start_line = 0
+        
+        for i, line in enumerate(lines):
+            signature_lines.append(line)
+            # Check if this line ends the signature
+            if language == "python" and line.rstrip().endswith(':'):
+                body_start_line = i + 1
+                break
+            elif language != "python" and '{' in line:
+                # For other languages, signature ends at the line with {
+                body_start_line = i + 1
+                break
+        
+        signature = '\n'.join(signature_lines)
+        body = '\n'.join(lines[body_start_line:]) if body_start_line < len(lines) else ""
+        
+        functions.append({
+            'signature': signature,
+            'body': body,
+            'full_text': function_text,
+            'start_byte': node.start_byte,
+            'end_byte': node.end_byte,
+            'start_line': content[:node.start_byte].count('\n'),
+            'end_line': content[:node.end_byte].count('\n')
+        })
+    
+    return functions
+
+
+def _create_optimal_context(
+    needle,
+    file_content_list: List[Tuple[str, str]],
+    position_ratio: float,
+    code_context_size: int,
+    language: str,
+    tokenizer,
+    repo_name: str
+):
+    """Create optimal context where functions are truncated to fit within token limits."""
+    
+    needle_file_idx = next(i for i, (path, _) in enumerate(file_content_list) if path == needle["path"])
+    
+    # Step 1: Use existing logic to determine which files would be included
+    # This respects position_ratio and gives us the same file selection as the original algorithm
+    
+    # Calculate prefix and suffix sizes
+    ntoken_needle_estimate = len(tokenizer.tokenize(needle.get("name", "function")))
+    prefix_size = int(code_context_size * position_ratio - ntoken_needle_estimate / 2)  
+    suffix_size = code_context_size - ntoken_needle_estimate - prefix_size
+    
+    # Collect all functions from files that would be in the context, preserving order
+    all_functions = []
+    needle_function_info = None
+    
+    # Process files in order they would appear in context
+    files_to_process = []
+    
+    # Add prefix files (in reverse order, then reverse the result)
+    prefix_files = []
+    temp_prefix_size = prefix_size
+    for i in range(needle_file_idx - 1, -1, -1):
+        if temp_prefix_size <= 0:
+            break
+        path, content = file_content_list[i]
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        path_tokens = len(tokenizer.tokenize(path_header))
+        if temp_prefix_size - path_tokens > 0:
+            prefix_files.insert(0, (path, content))  # Insert at beginning to maintain order
+            temp_prefix_size -= path_tokens
+        
+    files_to_process.extend(prefix_files)
+    
+    # Add needle file
+    files_to_process.append(file_content_list[needle_file_idx])
+    
+    # Add suffix files
+    temp_suffix_size = suffix_size
+    for i in range(needle_file_idx + 1, len(file_content_list)):
+        if temp_suffix_size <= 0:
+            break
+        path, content = file_content_list[i]  
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        path_tokens = len(tokenizer.tokenize(path_header))
+        if temp_suffix_size - path_tokens > 0:
+            files_to_process.append((path, content))
+            temp_suffix_size -= path_tokens
+    
+    # Step 2: Extract all functions from these files
+    for path, content in files_to_process:
+        functions = _extract_functions_from_content(language, content)
+        for func in functions:
+            func['path'] = path
+            func['is_needle'] = False
+            
+            # Check if this is the needle function
+            if path == needle["path"] and func['start_byte'] <= needle["start_byte"] < func['end_byte']:
+                func['is_needle'] = True
+                needle_function_info = func
+            
+            all_functions.append(func)
+    
+    # Ensure needle function is found
+    if not needle_function_info:
+        # Fallback: create needle function info manually
+        needle_path, needle_content = file_content_list[needle_file_idx]
+        needle_code = needle_content[needle["start_byte"] : needle["end_byte"]]
+        return {
+            'code_context': needle_code,
+            'needle_token_start': 0, 
+            'needle_token_end': len(tokenizer.tokenize(needle_code)),
+            'code_context_ntokens': len(tokenizer.tokenize(needle_code))
+        }
+    
+    # Step 3: Calculate optimal tokens per function
+    if len(all_functions) == 0:
+        return {
+            'code_context': "",
+            'needle_token_start': 0,
+            'needle_token_end': 0,
+            'code_context_ntokens': 0
+        }
+    
+    # Calculate overhead for path headers
+    overhead_tokens = 0
+    unique_paths = list(dict.fromkeys(func['path'] for func in all_functions))  # Preserve order
+    for path in unique_paths:
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        overhead_tokens += len(tokenizer.tokenize(path_header))
+    
+    available_tokens = code_context_size - overhead_tokens
+    
+    # Step 4: Build context with dynamic token allocation
+    # Instead of rigid per-function allocation, use greedy approach with redistribution
+    context_parts = []
+    current_path = None
+    needle_token_start = 0
+    needle_token_end = 0
+    total_tokens_used = 0
+    
+    # First pass: calculate what each function needs and wants
+    function_requirements = []
+    for func in all_functions:
+        signature_tokens = len(tokenizer.tokenize(func['signature']))
+        
+        # Calculate ideal tokens (signature + full body)
+        if func['body'].strip():
+            full_function = func['signature'] + '\n' + func['body']
+            ideal_tokens = len(tokenizer.tokenize(full_function))
+        else:
+            ideal_tokens = signature_tokens
+            
+        function_requirements.append({
+            'function': func,
+            'signature_tokens': signature_tokens,
+            'ideal_tokens': ideal_tokens,
+            'allocated_tokens': 0,
+            'content': ''
+        })
+    
+    # Second pass: allocate tokens with balanced approach
+    functions_too_large = []
+    remaining_budget = available_tokens
+    
+    # Sort functions to prioritize needle function first, then by size (smaller first for better fit)
+    sorted_requirements = sorted(function_requirements, 
+                                key=lambda x: (not x['function']['is_needle'], x['ideal_tokens']))
+    
+    # First ensure all functions get at least their signature if possible
+    signatures_total = sum(req['signature_tokens'] for req in function_requirements)
+    if signatures_total > available_tokens:
+        # Can't fit all signatures, prioritize needle
+        for req in sorted_requirements:
+            func = req['function']
+            if req['signature_tokens'] <= remaining_budget:
+                req['allocated_tokens'] = req['signature_tokens']
+                req['content'] = func['signature']
+                remaining_budget -= req['signature_tokens']
+            elif func['is_needle']:
+                # Always include needle signature, even if it exceeds budget
+                req['allocated_tokens'] = req['signature_tokens']
+                req['content'] = func['signature']
+                remaining_budget = 0
+                functions_too_large.append(func)
+                break
+    else:
+        # All signatures can fit, allocate signatures first
+        for req in function_requirements:
+            req['allocated_tokens'] = req['signature_tokens']
+            req['content'] = req['function']['signature']
+            remaining_budget -= req['signature_tokens']
+        
+        # Then distribute remaining tokens for body content, prioritizing smaller functions first
+        # (they're more likely to fit completely)
+        body_candidates = [req for req in sorted_requirements if req['function']['body'].strip()]
+        
+        for req in body_candidates:
+            func = req['function']
+            additional_needed = req['ideal_tokens'] - req['allocated_tokens']
+            
+            if additional_needed > 0 and remaining_budget > 0:
+                # Allocate as much as possible, but don't exceed what's needed or available
+                additional_allocation = min(additional_needed, remaining_budget)
+                req['allocated_tokens'] += additional_allocation
+                remaining_budget -= additional_allocation
+                
+                # Build content with body
+                available_for_body = req['allocated_tokens'] - req['signature_tokens']
+                body_lines = func['body'].split('\n')
+                body_part = ""
+                body_tokens = 0
+                
+                for line in body_lines:
+                    line_tokens = len(tokenizer.tokenize(line + '\n'))
+                    if body_tokens + line_tokens <= available_for_body:
+                        body_part += line + '\n'
+                        body_tokens += line_tokens
+                    else:
+                        break
+                
+                if body_part.strip():
+                    req['content'] = func['signature'] + '\n' + body_part.rstrip()
+                # else keep just signature (already set above)
+    
+    # Warn about functions that are too large
+    if functions_too_large:
+        needle_info = f"Function: {needle.get('name', 'unknown')} in {needle.get('path', 'unknown file')}"
+        task_info = f"Repo: {repo_name}"
+        print(f"⚠️  Warning: {needle_info} ({task_info})")
+        print(f"   {len(functions_too_large)} function(s) have signatures exceeding available budget.")
+    
+    # Third pass: build final context from allocated content
+    for req in function_requirements:
+        func = req['function']
+        
+        if not req['content']:  # Function was skipped
+            continue
+            
+        # Add path header if this is a new file
+        if func['path'] != current_path:
+            if current_path is not None:
+                context_parts.append('\n')
+            path_header = f"{COMMENT_PREFIX[language]} Path: {func['path']}\n"
+            context_parts.append(path_header)
+            current_path = func['path']
+        
+        # Calculate tokens used so far (for needle position tracking)
+        tokens_so_far = len(tokenizer.tokenize(''.join(context_parts)))
+        
+        # Track needle position
+        if func['is_needle']:
+            needle_token_start = tokens_so_far
+            needle_token_end = tokens_so_far + len(tokenizer.tokenize(req['content']))
+        
+        context_parts.append(req['content'])
+        # Add proper spacing between functions (like body context does)
+        if not req['content'].endswith('\n'):
+            context_parts.append('\n')
+        context_parts.append('\n')  # Extra newline for spacing between functions
+    
+    final_context = ''.join(context_parts).rstrip()
+    total_tokens = len(tokenizer.tokenize(final_context))
+    
+    return {
+        'code_context': final_context,
+        'needle_token_start': needle_token_start,
+        'needle_token_end': needle_token_end,
+        'code_context_ntokens': total_tokens
+    }
 
 
 def clean_context_comments(
@@ -296,6 +608,7 @@ def make_code_context(
     
     If context_type is "signature", uses function signatures instead of full file content.
     If context_type is "body" (default), uses full file content.
+    If context_type is "optimal", finds optimal token allocation per function to fit within context_size.
     """
     tokenizer = AutoTokenizer.from_pretrained("codellama/CodeLlama-7b-Instruct-hf")
 
@@ -307,6 +620,18 @@ def make_code_context(
         for i, (f, content) in enumerate(original_file_content_list)
         if f == needle["path"]
     ][0]
+
+    # Handle optimal context type - entirely different logic
+    if context_type == "optimal":
+        return _create_optimal_context(
+            needle, 
+            file_content_list, 
+            position_ratio, 
+            code_context_size, 
+            language, 
+            tokenizer,
+            repo_name
+        )
 
     # For signature context type, convert file contents to function signatures and extract needle as signature
     if context_type == "signature":
@@ -380,20 +705,23 @@ def make_code_context(
         # Add tokens for file content (respecting context_type)
         if context_type == "signature":
             content_to_tokenize = extract_all_function_signatures(language, content)
+        elif context_type == "optimal":
+            # For optimal, we don't warn here - warnings are handled in _create_optimal_context
+            content_to_tokenize = ""
         else:
             content_to_tokenize = content
         
         total_tokens += len(tokenizer.tokenize(content_to_tokenize))
     
-    # Warn if total exceeds context size
-    if total_tokens > code_context_size:
+    # Warn if total exceeds context size (skip for optimal as it handles its own warnings)
+    if total_tokens > code_context_size and context_type != "optimal":
         needle_info = f"Function: {needle.get('name', 'unknown')} in {needle.get('path', 'unknown file')}"
         task_info = f"Repo: {repo_name}"
         print(f"⚠️  Warning: {needle_info} ({task_info})")
         print(f"   All files contain {total_tokens} tokens, exceeding context size of {code_context_size}.")
         print(f"   Some files may be truncated in the final context.")
         if context_type == "body":
-            print(f"   Consider using --context_type signature to reduce token usage.")
+            print(f"   Consider using --context_type signature or optimal to reduce token usage.")
 
     ntoken_needle = len(tokenizer.tokenize(needle_code))
 
@@ -406,12 +734,35 @@ def make_code_context(
     suffix_size = code_context_size - ntoken_needle - prefix_size
 
     # handling prefix of the needle file
-    code_prefix, ntokens, is_break = _backward_tokenizable_lines(
-        [COMMENT_PREFIX[language] + " Path: " + needle["path"]]
-        + needle_file_content[: needle["start_byte"]].split("\n"),
-        tokenizer,
-        prefix_size,
-    )
+    if context_type == "signature":
+        # For signatures, we need to split the signatures string, not use byte positions
+        # Find which signature contains our needle
+        signatures = needle_file_content.split('\n')
+        needle_sig_idx = -1
+        for i, sig in enumerate(signatures):
+            # Simple heuristic: if the signature contains the needle function name
+            if needle.get('name', '') in sig:
+                needle_sig_idx = i
+                break
+        
+        if needle_sig_idx >= 0:
+            prefix_signatures = signatures[:needle_sig_idx]
+        else:
+            prefix_signatures = []
+            
+        code_prefix, ntokens, is_break = _backward_tokenizable_lines(
+            [COMMENT_PREFIX[language] + " Path: " + needle["path"]] + prefix_signatures,
+            tokenizer,
+            prefix_size,
+        )
+    else:
+        # For body and optimal contexts, use the original logic
+        code_prefix, ntokens, is_break = _backward_tokenizable_lines(
+            [COMMENT_PREFIX[language] + " Path: " + needle["path"]]
+            + needle_file_content[: needle["start_byte"]].split("\n"),
+            tokenizer,
+            prefix_size,
+        )
     prefix_size -= ntokens
 
     # handling prefix of the previous files
@@ -430,9 +781,28 @@ def make_code_context(
         index -= 1
 
     # handling suffix of the needle file
-    code_suffix, ntokens, is_break = _forward_tokenizable_lines(
-        needle_file_content[needle["end_byte"] :].split("\n"), tokenizer, suffix_size
-    )
+    if context_type == "signature":
+        # For signatures, get signatures after the needle
+        signatures = needle_file_content.split('\n')
+        needle_sig_idx = -1
+        for i, sig in enumerate(signatures):
+            if needle.get('name', '') in sig:
+                needle_sig_idx = i
+                break
+        
+        if needle_sig_idx >= 0 and needle_sig_idx + 1 < len(signatures):
+            suffix_signatures = signatures[needle_sig_idx + 1:]
+        else:
+            suffix_signatures = []
+            
+        code_suffix, ntokens, is_break = _forward_tokenizable_lines(
+            suffix_signatures, tokenizer, suffix_size
+        )
+    else:
+        # For body and optimal contexts, use the original logic
+        code_suffix, ntokens, is_break = _forward_tokenizable_lines(
+            needle_file_content[needle["end_byte"] :].split("\n"), tokenizer, suffix_size
+        )
     suffix_size -= ntokens
 
     # handling suffix of the next files
@@ -466,6 +836,16 @@ def make_code_context(
             clean_comments == CleanComment.PositionalPadding,
         )
 
+    # For signature context, ensure proper spacing between parts
+    if context_type == "signature":
+        # Make sure each part ends with a newline for proper separation
+        if code_prefix and not code_prefix.endswith('\n'):
+            code_prefix += '\n'
+        if needle_code and not needle_code.endswith('\n'):
+            needle_code += '\n'
+        if code_suffix and not code_suffix.endswith('\n'):
+            code_suffix += '\n'
+    
     code_context = code_prefix + needle_code + code_suffix
 
     needle_token_start = len(tokenizer.tokenize(code_prefix))
@@ -588,7 +968,9 @@ def evaluate_model(
 
         print(f"🔥 Preparing code context for {lang}...")
         with progress(f"Processing {lang} context") as pbar:
-            for repo in pbar.track(repos):
+            # !!!!!!!!!!! FOR TESTS ONLY !!!!!!!!!!!
+            # for repo in pbar.track(repos):
+            for repo in pbar.track(repos[:1]):
                 # skip if the repo does not have needles
                 if "needles" not in repo:
                     pbar.console.print(
