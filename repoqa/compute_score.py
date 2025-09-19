@@ -83,6 +83,15 @@ def remove_comments(source_code: str, lang: str) -> str:
 
 def sanitize_output(model_output: str, lang: str) -> str:
     model_output = model_output.strip()
+    
+    # Strip out XML tags and their contents
+    xml_pattern = r'<[^>]+>.*?</[^>]+>'
+    model_output = re.sub(xml_pattern, '', model_output, flags=re.DOTALL)
+    
+    # Also strip self-closing XML tags
+    self_closing_xml_pattern = r'<[^>]+/>'
+    model_output = re.sub(self_closing_xml_pattern, '', model_output)
+    
     search_pattern = r"^```(?:\w+)?\s*\n(.*?)(?=^```)```"
     code_blocks = re.findall(search_pattern, model_output, re.DOTALL | re.MULTILINE)
 
@@ -166,10 +175,9 @@ def needle_evaluator(
 
     if task_type == "echo_signature":
         similarity = compute_function_similarity(sanitized_output, ground_truth)
-        if similarity > 0.99:  # or your preferred threshold
-            return Result.BEST_MATCH, ground_truth, similarity
-        else:
-            return Result.FAIL_MATCH, ground_truth, similarity
+        # Don't use hard-coded threshold here - let threshold-based scoring handle it
+        # Always return BEST_MATCH to indicate we found the target, with actual similarity score
+        return Result.BEST_MATCH, ground_truth, similarity
     if task_type == "find_file":
         # Normalize whitespace and compare
         output_path = sanitize_output(model_output, lang).strip()
