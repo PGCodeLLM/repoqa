@@ -11,7 +11,7 @@ from tree_sitter_languages import get_language, get_parser
 
 from repoqa.compute_score import compute_score, save_json
 from repoqa.data import CACHE_DIR, get_repoqa_data
-from repoqa.utility import COMMENT_QUERY, progress, topological_sort
+from repoqa.utility import COMMENT_QUERY, progress, topological_sort, extract_function_signature
 
 COMMENT_PREFIX = {
     "python": "#",
@@ -30,6 +30,20 @@ INSTRUCTION = (
     " please retrieve and repeat the exact described function from the code context in a code block wrapped by ```:"
 )
 
+ECHO_SIGNATURE_INSTRUCTION = (
+    "Based on the function description and code context," 
+    " please retrieve and repeat the following function's signature from the code context in a code block wrapped by ```:"
+)
+
+ECHO_SIGNATURE_TEMPLATE = "instruction\nname\ncode_context\ninstruction\nname"
+
+FIND_FILE_INSTRUCTION = (
+    "Based on the function description and code context,"
+    " output the file path where the following function is defined, without any additional text or explanation."
+)
+
+FIND_FILE_TEMPLATE = "instruction\nname\ncode_context\ninstruction\nname"
+
 # Mode to clean context comments
 class CleanComment(Enum):
     NoClean = "none"
@@ -42,12 +56,22 @@ def _backward_tokenizable_lines(lines, tokenizer, max_tokens):
     text = ""
     ntokens = 0
     is_break = False
+    is_latest_line = True
     for line in reversed(lines):
-        new_ntokens = len(tokenizer.tokenize(line + "\n"))
+        # if the first processed line is not empty, we do not add a new line after it
+        if is_latest_line:
+            NEW_LINE = ''
+            if line == '':
+                NEW_LINE = '\n'
+            is_latest_line = False
+        else:
+            NEW_LINE = '\n'
+
+        new_ntokens = len(tokenizer.tokenize(line + NEW_LINE))
         if ntokens + new_ntokens > max_tokens:
             is_break = True
             break
-        text = line + "\n" + text
+        text = line + NEW_LINE + text
         ntokens += new_ntokens
     return text, ntokens, is_break
 
@@ -386,6 +410,7 @@ def evaluate_model(
     eval_ignore_comments: bool = False,  # ignore comments during score computation
     trust_remote_code: bool = False,
     attn_implementation=None,
+    task_type: str = "needle_search",
 ):
     if backend is None:
         if base_url is not None:
@@ -400,6 +425,12 @@ def evaluate_model(
             dataset = json.load(f)
     else:
         dataset = get_repoqa_data()
+
+    allowed_task_types = ["needle_search", "echo_signature", "find_file"]
+    if task_type not in allowed_task_types:
+        raise ValueError(
+            f"Invalid task_type '{task_type}'. Allowed values: {allowed_task_types}"
+        )
 
     # makedir if not exists
     os.makedirs(result_dir, exist_ok=True)
@@ -494,6 +525,16 @@ def evaluate_model(
                         tasks.append(cache[cache_id])
                         continue
 
+                    # Get the file content for the needle's file
+                    file_content = repo["content"][needle["path"]]
+                    # Extract the function signature using the utility function
+                    signature = extract_function_signature(
+                        lang,
+                        file_content,
+                        needle["start_byte"],
+                        needle["end_byte"],
+                    )
+
                     task = {
                         "repo": repo["repo"],
                         "name": needle["name"],
@@ -503,6 +544,7 @@ def evaluate_model(
                         "description": f"\nFunction Description:{needle['description']}\n",
                         "instruction": INSTRUCTION,
                         "template": TEMPLATE,
+                        "signature": signature,
                     }
                     code_context_info = make_code_context(
                         needle,
@@ -579,13 +621,42 @@ def evaluate_model(
                     f"position ratio: actual={actual_position_ratio:.2f}, expected={task['position_ratio']}"
                 )
                 prompt = ""
-                for key in task["template"].split("\n"):
-                    prompt += task[key]
+                if task_type == "needle_search":
+                    for key in task["template"].split("\n"):
+                        prompt += task[key]
+                elif task_type == "echo_signature":
+                    prompt = (
+                        ECHO_SIGNATURE_INSTRUCTION
+                        + "\n"
+                        + f"Function name: {task['name']}"
+                        + "\n"
+                        + task["code_context"]
+                        + "\n"
+                        + ECHO_SIGNATURE_INSTRUCTION
+                        + "\n"
+                        + f"Function name: {task['name']}"
+                    )
+                elif task_type == "find_file":
+                    prompt = (
+                        FIND_FILE_INSTRUCTION
+                        + "\n"
+                        + f"Function name: {task['name']}"
+                        + "\n"
+                        + task["code_context"]
+                        + "\n"
+                        + FIND_FILE_INSTRUCTION
+                        + "\n"
+                        + f"Function name: {task['name']}"
+                    )
+                else:
+                    raise ValueError(f"Unknown task type: {task_type}")
 
                 replies = engine.generate_reply(
                     prompt, n=1, max_tokens=max_new_tokens, system_msg=system_message
                 )
-                result = {**task, "output": replies}
+                result = {**task, "output": replies, "task_type": task_type}
+                # if task_type == "find_file":
+                #     result["ground_truth_path"] = task["path"]
                 f_out.write(json.dumps(result) + "\n")
                 f_out.flush()
                 model_outputs.append(result)

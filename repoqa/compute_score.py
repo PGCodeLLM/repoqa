@@ -157,13 +157,29 @@ def needle_evaluator(
     repo_info: Dict,
     lang: str,
     ignore_comments: bool,
+    task_type: str = "needle_search",
 ) -> Tuple[Result, str, float]:
     contents = repo_info["content"]
     needles = repo_info["needles"]
 
+    sanitized_output = sanitize_output(model_output, lang)
+
+    if task_type == "echo_signature":
+        similarity = compute_function_similarity(sanitized_output, ground_truth)
+        if similarity > 0.99:  # or your preferred threshold
+            return Result.BEST_MATCH, ground_truth, similarity
+        else:
+            return Result.FAIL_MATCH, ground_truth, similarity
+    if task_type == "find_file":
+        # Normalize whitespace and compare
+        output_path = sanitize_output(model_output, lang).strip()
+        if output_path == ground_truth:
+            return Result.BEST_MATCH, ground_truth, 1.0
+        else:
+            return Result.FAIL_MATCH, ground_truth, 0.0
+
     best_target = None
     best_similarity = 0
-    sanitized_output = sanitize_output(model_output, lang)
     if ignore_comments:
         sanitized_output = remove_comments(sanitized_output, lang)
     for needle in needles:
@@ -265,12 +281,18 @@ def compute_score(
             lang = result["language"]
             repo_name = result["repo"]
             model_outputs = result["output"]
-            ground_truth = result["name"]
+            task_type = result.get("task_type", "needle_search")
+            if task_type == "find_file":
+                ground_truth = result["path"]
+            elif task_type == "echo_signature":
+                ground_truth = result["signature"]
+            else:
+                ground_truth = result["name"]
             repo_info = _get_repo(dataset[lang], repo_name)
 
             model_output = model_outputs[0]
             verdict, best_target, best_similarity = needle_evaluator(
-                model_output, ground_truth, repo_info, lang, ignore_comments
+                model_output, ground_truth, repo_info, lang, ignore_comments, task_type=task_type
             )
 
             is_best_similar = False
@@ -288,6 +310,7 @@ def compute_score(
                     "token_start": result["needle_token_start"],
                     "token_end": result["needle_token_end"],
                 },
+                "task_type": task_type,
             }
             evaluation_result[lang].append(current_task)
 
