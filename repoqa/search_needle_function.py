@@ -27,19 +27,19 @@ TEMPLATE = "instruction\ncode_context\ndescription\ninstruction"
 
 INSTRUCTION = (
     "Based on the function description and code context,"
-    " please retrieve and repeat the exact described function from the code context in a code block wrapped by ```:"
+    " please retrieve and repeat the exact described function from the code context in a code block wrapped by ```:\n"
 )
 
 ECHO_SIGNATURE_INSTRUCTION = (
     "Based on the function description and code context," 
-    " please retrieve and repeat the following function's signature from the code context in a code block wrapped by ```:"
+    " please retrieve and repeat the following function's signature from the code context in a code block wrapped by ```:\n"
 )
 
 ECHO_SIGNATURE_TEMPLATE = "instruction\nname\ncode_context\ninstruction\nname"
 
 FIND_FILE_INSTRUCTION = (
     "Based on the function description and code context,"
-    " output the file path where the following function is defined, without any additional text or explanation."
+    " output the file path where the following function is defined, without any additional text or explanation.\n"
 )
 
 FIND_FILE_TEMPLATE = "instruction\nname\ncode_context\ninstruction\nname"
@@ -190,10 +190,40 @@ def clean_partial_file(language, whole_file, partial_lines, path):
 
 
 def _extract_functions_from_content(language: str, content: str):
-    """Extract all functions from content with their positions and full text."""
+    """Extract all functions from content with their positions and full text, including class context for methods."""
     parser = get_parser(language)
     source_bytes = bytes(content, "utf8")
     tree = parser.parse(source_bytes)
+    
+    # Helper function to find the parent class node
+    def find_parent_class(function_node):
+        """Find the parent class node for a function, if any."""
+        current = function_node.parent
+        while current:
+            if current.type in ["class_definition", "class_declaration"]:
+                return current
+            current = current.parent
+        return None
+    
+    # Helper function to extract class signature
+    def extract_class_signature(class_node):
+        """Extract class signature (class name and inheritance)."""
+        class_text = source_bytes[class_node.start_byte:class_node.end_byte].decode("utf8")
+        lines = class_text.split('\n')
+        
+        # For Python, find the line with ':'
+        if language == "python":
+            for i, line in enumerate(lines):
+                if line.rstrip().endswith(':'):
+                    return '\n'.join(lines[:i+1])
+        else:
+            # For other languages, find the line with '{'
+            for i, line in enumerate(lines):
+                if '{' in line:
+                    return '\n'.join(lines[:i+1])
+        
+        # Fallback to first line if no clear separator found
+        return lines[0] if lines else ""
     
     # Get function query for this language
     fn_query = get_language(language).query(FUNCTION_QUERY[language])
@@ -203,7 +233,11 @@ def _extract_functions_from_content(language: str, content: str):
         node, _ = capture
         function_text = source_bytes[node.start_byte:node.end_byte].decode("utf8")
         
-        # Extract signature (up to first { or :)
+        # Check if this function is inside a class
+        parent_class = find_parent_class(node)
+        is_method = parent_class is not None
+        
+        # Extract function signature (up to first { or :)
         lines = function_text.split('\n')
         signature_lines = []
         body_start_line = 0
@@ -219,23 +253,41 @@ def _extract_functions_from_content(language: str, content: str):
                 body_start_line = i + 1
                 break
         
-        signature = '\n'.join(signature_lines)
-        body = '\n'.join(lines[body_start_line:]) if body_start_line < len(lines) else ""
+        function_signature = '\n'.join(signature_lines)
+        function_body = '\n'.join(lines[body_start_line:]) if body_start_line < len(lines) else ""
+        
+        # For methods, create enhanced signature with class context
+        if is_method:
+            class_signature = extract_class_signature(parent_class)
+            # Add proper indentation to function signature to show it's inside a class
+            indented_function_signature = '\n'.join(['    ' + line if line.strip() else line 
+                                                   for line in function_signature.split('\n')])
+            enhanced_signature = f"{class_signature}\n{indented_function_signature}"
+            
+            # For full text of methods, we might want to include minimal class context
+            # But for now, keep the original function text to avoid token bloat
+            enhanced_full_text = function_text
+        else:
+            # Regular function - no class context needed
+            enhanced_signature = function_signature
+            enhanced_full_text = function_text
         
         functions.append({
-            'signature': signature,
-            'body': body,
-            'full_text': function_text,
+            'signature': enhanced_signature,
+            'body': function_body,
+            'full_text': enhanced_full_text,
             'start_byte': node.start_byte,
             'end_byte': node.end_byte,
             'start_line': content[:node.start_byte].count('\n'),
-            'end_line': content[:node.end_byte].count('\n')
+            'end_line': content[:node.end_byte].count('\n'),
+            'is_method': is_method,
+            'class_name': source_bytes[parent_class.start_byte:parent_class.end_byte].decode("utf8").split('\n')[0].strip() if parent_class else None
         })
     
     return functions
 
 
-def _create_optimal_context(
+def _create_mixed_context(
     needle,
     file_content_list: List[Tuple[str, str]],
     position_ratio: float,
@@ -244,7 +296,7 @@ def _create_optimal_context(
     tokenizer,
     repo_name: str
 ):
-    """Create optimal context where functions are truncated to fit within token limits."""
+    """Create mixed context with dynamic allocation (complete small + signature large functions)."""
     
     needle_file_idx = next(i for i, (path, _) in enumerate(file_content_list) if path == needle["path"])
     
@@ -397,37 +449,25 @@ def _create_optimal_context(
             req['content'] = req['function']['signature']
             remaining_budget -= req['signature_tokens']
         
-        # Then distribute remaining tokens for body content, prioritizing smaller functions first
-        # (they're more likely to fit completely)
+        # Then determine which functions can fit completely with remaining tokens
+        # Mixed context uses binary decision: complete function OR signature only
         body_candidates = [req for req in sorted_requirements if req['function']['body'].strip()]
         
         for req in body_candidates:
             func = req['function']
             additional_needed = req['ideal_tokens'] - req['allocated_tokens']
             
-            if additional_needed > 0 and remaining_budget > 0:
-                # Allocate as much as possible, but don't exceed what's needed or available
-                additional_allocation = min(additional_needed, remaining_budget)
-                req['allocated_tokens'] += additional_allocation
-                remaining_budget -= additional_allocation
+            if additional_needed > 0 and remaining_budget >= additional_needed:
+                # Only allocate if we can fit the COMPLETE function body
+                req['allocated_tokens'] += additional_needed
+                remaining_budget -= additional_needed
                 
-                # Build content with body
-                available_for_body = req['allocated_tokens'] - req['signature_tokens']
-                body_lines = func['body'].split('\n')
-                body_part = ""
-                body_tokens = 0
-                
-                for line in body_lines:
-                    line_tokens = len(tokenizer.tokenize(line + '\n'))
-                    if body_tokens + line_tokens <= available_for_body:
-                        body_part += line + '\n'
-                        body_tokens += line_tokens
-                    else:
-                        break
-                
-                if body_part.strip():
-                    req['content'] = func['signature'] + '\n' + body_part.rstrip()
-                # else keep just signature (already set above)
+                # Include complete function - for methods use enhanced signature + body, for functions use full text
+                if func['is_method']:
+                    req['content'] = func['signature'] + '\n' + func['body']
+                else:
+                    req['content'] = func['full_text']
+            # else keep just signature (already set above)
     
     # Warn about functions that are too large
     if functions_too_large:
@@ -437,6 +477,7 @@ def _create_optimal_context(
         print(f"   {len(functions_too_large)} function(s) have signatures exceeding available budget.")
     
     # Third pass: build final context from allocated content
+    current_class = None
     for req in function_requirements:
         func = req['function']
         
@@ -446,10 +487,11 @@ def _create_optimal_context(
         # Add path header if this is a new file
         if func['path'] != current_path:
             if current_path is not None:
-                context_parts.append('\n')
+                context_parts.append('\n')  # Blank line before new path block
             path_header = f"{COMMENT_PREFIX[language]} Path: {func['path']}\n"
             context_parts.append(path_header)
             current_path = func['path']
+            current_class = None  # Reset class context when changing files
         
         # Calculate tokens used so far (for needle position tracking)
         tokens_so_far = len(tokenizer.tokenize(''.join(context_parts)))
@@ -459,9 +501,269 @@ def _create_optimal_context(
             needle_token_start = tokens_so_far
             needle_token_end = tokens_so_far + len(tokenizer.tokenize(req['content']))
         
-        context_parts.append(req['content'])
-        # Add proper spacing between functions (like body context does)
+        # Handle class grouping for methods
+        if func['is_method']:
+            # Check if we need to add class definition
+            if func['class_name'] != current_class:
+                # New class - add class definition
+                class_def = func['signature'].split('\n')[0]  # First line is class definition
+                context_parts.append(class_def + '\n')
+                current_class = func['class_name']
+            
+            # For methods, use content without class definition (already added above)
+            if '\n' in req['content'] and req['content'].split('\n')[0].strip().startswith('class '):
+                # Remove class definition line from method content
+                method_content = '\n'.join(req['content'].split('\n')[1:])
+                context_parts.append(method_content)
+            else:
+                context_parts.append(req['content'])
+        else:
+            # Standalone function - add as-is and reset class context
+            context_parts.append(req['content'])
+            current_class = None
+        
+        # Add proper spacing between functions
         if not req['content'].endswith('\n'):
+            context_parts.append('\n')
+        context_parts.append('\n')  # Extra newline for spacing between functions
+    
+    final_context = ''.join(context_parts).rstrip()
+    total_tokens = len(tokenizer.tokenize(final_context))
+    
+    return {
+        'code_context': final_context,
+        'needle_token_start': needle_token_start,
+        'needle_token_end': needle_token_end,
+        'code_context_ntokens': total_tokens
+    }
+
+
+def _create_optimal_context(
+    needle,
+    file_content_list: List[Tuple[str, str]],
+    position_ratio: float,
+    code_context_size: int,
+    language: str,
+    tokenizer,
+    repo_name: str
+):
+    """Create optimal context with fair token distribution and partial function support."""
+    
+    needle_file_idx = next(i for i, (path, _) in enumerate(file_content_list) if path == needle["path"])
+    
+    # Step 1: Determine which files to include (same logic as mixed context)
+    ntoken_needle_estimate = len(tokenizer.tokenize(needle.get("name", "function")))
+    prefix_size = int(code_context_size * position_ratio - ntoken_needle_estimate / 2)  
+    suffix_size = code_context_size - ntoken_needle_estimate - prefix_size
+    
+    # Collect all functions from files that would be in the context, preserving order
+    all_functions = []
+    needle_function_info = None
+    
+    # Process files in order they would appear in context
+    files_to_process = []
+    
+    # Add prefix files (in reverse order, then reverse the result)
+    prefix_files = []
+    temp_prefix_size = prefix_size
+    for i in range(needle_file_idx - 1, -1, -1):
+        if temp_prefix_size <= 0:
+            break
+        path, content = file_content_list[i]
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        path_tokens = len(tokenizer.tokenize(path_header))
+        if temp_prefix_size - path_tokens > 0:
+            prefix_files.insert(0, (path, content))  # Insert at beginning to maintain order
+            temp_prefix_size -= path_tokens
+        
+    files_to_process.extend(prefix_files)
+    
+    # Add needle file
+    files_to_process.append(file_content_list[needle_file_idx])
+    
+    # Add suffix files
+    temp_suffix_size = suffix_size
+    for i in range(needle_file_idx + 1, len(file_content_list)):
+        if temp_suffix_size <= 0:
+            break
+        path, content = file_content_list[i]  
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        path_tokens = len(tokenizer.tokenize(path_header))
+        if temp_suffix_size - path_tokens > 0:
+            files_to_process.append((path, content))
+            temp_suffix_size -= path_tokens
+    
+    # Step 2: Extract all functions from these files
+    for path, content in files_to_process:
+        functions = _extract_functions_from_content(language, content)
+        for func in functions:
+            func['path'] = path
+            func['is_needle'] = False
+            
+            # Check if this is the needle function
+            if path == needle["path"] and func['start_byte'] <= needle["start_byte"] < func['end_byte']:
+                func['is_needle'] = True
+                needle_function_info = func
+            
+            all_functions.append(func)
+    
+    # Ensure needle function is found
+    if not needle_function_info:
+        # Fallback: create needle function info manually
+        needle_path, needle_content = file_content_list[needle_file_idx]
+        needle_code = needle_content[needle["start_byte"] : needle["end_byte"]]
+        return {
+            'code_context': needle_code,
+            'needle_token_start': 0, 
+            'needle_token_end': len(tokenizer.tokenize(needle_code)),
+            'code_context_ntokens': len(tokenizer.tokenize(needle_code))
+        }
+    
+    # Step 3: Calculate overhead for path headers
+    if len(all_functions) == 0:
+        return {
+            'code_context': "",
+            'needle_token_start': 0,
+            'needle_token_end': 0,
+            'code_context_ntokens': 0
+        }
+    
+    overhead_tokens = 0
+    unique_paths = list(dict.fromkeys(func['path'] for func in all_functions))  # Preserve order
+    for path in unique_paths:
+        path_header = f"{COMMENT_PREFIX[language]} Path: {path}\n"
+        overhead_tokens += len(tokenizer.tokenize(path_header))
+    
+    available_tokens = code_context_size - overhead_tokens
+    
+    # Step 4: Fair token distribution algorithm
+    n_functions = len(all_functions)
+    base_budget_per_function = available_tokens // n_functions if n_functions > 0 else 0
+    
+    # Phase 1: Categorize functions and calculate spare tokens
+    small_functions = []  # fit completely within base budget
+    large_functions = []  # need more than base budget
+    spare_tokens = 0
+    
+    for func in all_functions:
+        signature_tokens = len(tokenizer.tokenize(func['signature']))
+        full_tokens = len(tokenizer.tokenize(func['full_text']))
+        
+        func['signature_tokens'] = signature_tokens
+        func['full_tokens'] = full_tokens
+        
+        if full_tokens <= base_budget_per_function:
+            small_functions.append(func)
+            spare_tokens += (base_budget_per_function - full_tokens)
+        else:
+            large_functions.append(func)
+    
+    # Phase 2: Distribute spare tokens equally among large functions
+    if len(large_functions) > 0:
+        extra_tokens_per_large = spare_tokens // len(large_functions)
+        tokens_per_large_function = base_budget_per_function + extra_tokens_per_large
+    else:
+        tokens_per_large_function = 0
+    
+    # Step 5: Build context with allocated tokens IN ORIGINAL ORDER
+    context_parts = []
+    current_path = None
+    current_class = None
+    needle_token_start = 0
+    needle_token_end = 0
+    
+    for func in all_functions:  # Maintain original order!
+        # Add path header if this is a new file
+        if func['path'] != current_path:
+            if current_path is not None:
+                context_parts.append('\n')  # Blank line before new path block
+            path_header = f"{COMMENT_PREFIX[language]} Path: {func['path']}\n"
+            context_parts.append(path_header)
+            current_path = func['path']
+            current_class = None  # Reset class context when changing files
+        
+        # Calculate tokens used so far (for needle position tracking)
+        tokens_so_far = len(tokenizer.tokenize(''.join(context_parts)))
+        
+        # Generate content based on function category
+        if func in small_functions:
+            # Include complete function, but for methods, use enhanced signature + body
+            if func['is_method']:
+                # For small methods, show class context + complete method
+                function_content = func['signature'] + '\n' + func['body']
+            else:
+                # For standalone functions, use full text as usual
+                function_content = func['full_text']
+        else:
+            # Large function - use allocated tokens with partial content
+            available_tokens = tokens_per_large_function
+            
+            if available_tokens <= func['signature_tokens']:
+                # Not enough tokens even for signature - just include signature
+                function_content = func['signature']
+            else:
+                # Include signature + partial body with truncation indicator
+                available_for_body = available_tokens - func['signature_tokens']
+                
+                # Reserve tokens for truncation indicator
+                truncation_indicator = "    # ... (truncated)"
+                truncation_tokens = len(tokenizer.tokenize(truncation_indicator))
+                available_for_body -= truncation_tokens
+                
+                if available_for_body > 0 and func['body'].strip():
+                    # Include partial body
+                    body_lines = func['body'].split('\n')
+                    included_body = ""
+                    current_tokens = 0
+                    
+                    for line in body_lines:
+                        line_with_newline = line + '\n'
+                        line_tokens = len(tokenizer.tokenize(line_with_newline))
+                        
+                        if current_tokens + line_tokens <= available_for_body:
+                            included_body += line_with_newline
+                            current_tokens += line_tokens
+                        else:
+                            break
+                    
+                    # Construct partial function
+                    function_content = func['signature'] + '\n'
+                    if included_body.strip():
+                        function_content += included_body.rstrip() + '\n' + truncation_indicator
+                    else:
+                        function_content = func['signature']  # No room for body
+                else:
+                    # Just signature
+                    function_content = func['signature']
+        
+        # Track needle position
+        if func['is_needle']:
+            needle_token_start = tokens_so_far
+            needle_token_end = tokens_so_far + len(tokenizer.tokenize(function_content))
+        
+        # Handle class grouping for methods
+        if func['is_method']:
+            # Check if we need to add class definition
+            if func['class_name'] != current_class:
+                # New class - add class definition
+                class_def = func['signature'].split('\n')[0]  # First line is class definition
+                context_parts.append(class_def + '\n')
+                current_class = func['class_name']
+            
+            # For methods, use content without class definition (already added above)
+            if '\n' in function_content and function_content.split('\n')[0].strip().startswith('class '):
+                # Remove class definition line from method content
+                method_content = '\n'.join(function_content.split('\n')[1:])
+                context_parts.append(method_content)
+            else:
+                context_parts.append(function_content)
+        else:
+            # Standalone function - add as-is and reset class context
+            context_parts.append(function_content)
+            current_class = None
+        
+        # Add proper spacing between functions
+        if not function_content.endswith('\n'):
             context_parts.append('\n')
         context_parts.append('\n')  # Extra newline for spacing between functions
     
@@ -597,6 +899,7 @@ def make_code_context(
     clean_comments: CleanComment = CleanComment.NoClean,
     context_type: str = "body",
     repo_name: str = "unknown",
+    tokenizer = None,
 ) -> str:
     """
     Slice the file_content_list such that:
@@ -608,9 +911,11 @@ def make_code_context(
     
     If context_type is "signature", uses function signatures instead of full file content.
     If context_type is "body" (default), uses full file content.
-    If context_type is "optimal", finds optimal token allocation per function to fit within context_size.
+    If context_type is "mixed", uses dynamic allocation (complete small + signature large functions).
+    If context_type is "optimal", uses fair token distribution with partial function support.
     """
-    tokenizer = AutoTokenizer.from_pretrained("codellama/CodeLlama-7b-Instruct-hf")
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained("codellama/CodeLlama-7b-Instruct-hf")
 
     # Keep original file content list for needle extraction
     original_file_content_list = file_content_list
@@ -621,7 +926,19 @@ def make_code_context(
         if f == needle["path"]
     ][0]
 
-    # Handle optimal context type - entirely different logic
+    # Handle mixed context type - dynamic allocation (complete small + signature large)
+    if context_type == "mixed":
+        return _create_mixed_context(
+            needle, 
+            file_content_list, 
+            position_ratio, 
+            code_context_size, 
+            language, 
+            tokenizer,
+            repo_name
+        )
+    
+    # Handle optimal context type - fair token distribution with partial functions
     if context_type == "optimal":
         return _create_optimal_context(
             needle, 
@@ -635,57 +952,49 @@ def make_code_context(
 
     # For signature context type, convert file contents to function signatures and extract needle as signature
     if context_type == "signature":
-        # First, extract all signatures from the needle file to find the needle function signature
-        all_signatures = extract_all_function_signatures(language, needle_file_content)
+        # Use our enhanced function extraction that includes class context
+        needle_file_functions = _extract_functions_from_content(language, needle_file_content)
         
-        # Parse the file to find which function contains the needle start_byte
-        parser = get_parser(language)
-        source_bytes = bytes(needle_file_content, "utf8")
-        tree = parser.parse(source_bytes)
-        root = tree.root_node
+        # Find the needle function and get its enhanced signature
+        needle_function = None
+        for func in needle_file_functions:
+            if func['start_byte'] <= needle["start_byte"] < func['end_byte']:
+                needle_function = func
+                break
         
-        # Language-specific node types for function definitions
-        node_types = {
-            "python": ["function_definition", "async_function_definition"],
-            "java": ["method_declaration", "constructor_declaration"],
-            "typescript": ["function_declaration", "method_definition"],
-            "rust": ["function_item"],
-            "cpp": ["function_definition"],
-            "go": ["function_declaration", "method_declaration"],
-        }
-        types = node_types.get(language, [])
-        
-        def find_containing_function(node):
-            if node.type in types and node.start_byte <= needle["start_byte"] < node.end_byte:
-                return node
-            for child in node.children:
-                result = find_containing_function(child)
-                if result:
-                    return result
-            return None
-        
-        needle_func_node = find_containing_function(root)
-        if needle_func_node:
-            # Extract just the signature part of this function
-            sig_end = needle_func_node.end_byte  # fallback
-            for child in needle_func_node.children:
-                # For Python, function body starts with ':'
-                if language == "python" and child.type == ":":
-                    sig_end = child.end_byte
-                    break
-                # For other languages, function body starts with '{'
-                if language != "python" and child.type == "{":
-                    sig_end = child.start_byte
-                    break
-            needle_code = source_bytes[needle_func_node.start_byte:sig_end].decode("utf8").strip()
+        if needle_function:
+            needle_code = needle_function['signature']
         else:
             # Fallback to original needle code if we can't find the function
             needle_code = needle_file_content[needle["start_byte"] : needle["end_byte"]]
         
-        # Convert all file contents to function signatures
+        # Convert all file contents to enhanced function signatures with optimized class grouping
         processed_file_content_list = []
         for path, content in original_file_content_list:
-            signatures = extract_all_function_signatures(language, content)
+            functions = _extract_functions_from_content(language, content)
+            
+            # Group functions by class to avoid duplicate class definitions
+            signatures_parts = []
+            current_class = None
+            
+            for func in functions:
+                if func['is_method']:
+                    # This is a method - check if we need to add class definition
+                    if func['class_name'] != current_class:
+                        # New class - add class definition
+                        class_def = func['signature'].split('\n')[0]  # First line is class definition
+                        signatures_parts.append(class_def)
+                        current_class = func['class_name']
+                    
+                    # Add the method signature (already indented)
+                    method_signature = '\n'.join(func['signature'].split('\n')[1:])  # Skip class definition line
+                    signatures_parts.append(method_signature)
+                else:
+                    # Standalone function - add as-is and reset class context
+                    signatures_parts.append(func['signature'])
+                    current_class = None
+            
+            signatures = '\n'.join(signatures_parts)
             processed_file_content_list.append((path, signatures))
         file_content_list = processed_file_content_list
         
@@ -705,23 +1014,23 @@ def make_code_context(
         # Add tokens for file content (respecting context_type)
         if context_type == "signature":
             content_to_tokenize = extract_all_function_signatures(language, content)
-        elif context_type == "optimal":
-            # For optimal, we don't warn here - warnings are handled in _create_optimal_context
+        elif context_type in ["optimal", "mixed"]:
+            # For optimal and mixed, we don't warn here - warnings are handled in their respective functions
             content_to_tokenize = ""
         else:
             content_to_tokenize = content
         
         total_tokens += len(tokenizer.tokenize(content_to_tokenize))
     
-    # Warn if total exceeds context size (skip for optimal as it handles its own warnings)
-    if total_tokens > code_context_size and context_type != "optimal":
+    # Warn if total exceeds context size (skip for optimal and mixed as they handle their own warnings)
+    if total_tokens > code_context_size and context_type not in ["optimal", "mixed"]:
         needle_info = f"Function: {needle.get('name', 'unknown')} in {needle.get('path', 'unknown file')}"
         task_info = f"Repo: {repo_name}"
         print(f"⚠️  Warning: {needle_info} ({task_info})")
         print(f"   All files contain {total_tokens} tokens, exceeding context size of {code_context_size}.")
         print(f"   Some files may be truncated in the final context.")
         if context_type == "body":
-            print(f"   Consider using --context_type signature or optimal to reduce token usage.")
+            print(f"   Consider using --context_type signature, mixed, or optimal to reduce token usage.")
 
     ntoken_needle = len(tokenizer.tokenize(needle_code))
 
@@ -776,7 +1085,11 @@ def make_code_context(
             tokenizer,
             prefix_size,
         )
-        code_prefix = prefix + code_prefix
+        # Add blank line before this file if there's already content
+        if code_prefix.strip():
+            code_prefix = prefix + "\n" + code_prefix
+        else:
+            code_prefix = prefix + code_prefix
         prefix_size -= ntokens
         index -= 1
 
@@ -816,7 +1129,11 @@ def make_code_context(
             tokenizer,
             suffix_size,
         )
-        code_suffix += suffix
+        # Add blank line before this file if there's already content
+        if code_suffix.strip():
+            code_suffix += "\n" + suffix
+        else:
+            code_suffix += suffix
         suffix_size -= ntokens
         index += 1
 
@@ -858,6 +1175,50 @@ def make_code_context(
         "needle_token_end": needle_token_end,
         "code_context_ntokens": code_context_ntokens,
     }
+
+
+def _calculate_prompt_overhead_tokens(task_type: str, needle_name: str, needle_description: str, tokenizer) -> int:
+    """Calculate the number of tokens used by prompt instructions and other non-code-context elements."""
+    
+    if task_type == "needle_search":
+        # Build prompt template without code_context
+        prompt_parts = [
+            INSTRUCTION,  # instruction
+            # code_context would go here but we skip it
+            needle_description,  # description  
+            INSTRUCTION  # instruction again
+        ]
+        prompt_without_context = "".join(prompt_parts)
+        
+    elif task_type == "echo_signature":
+        prompt_without_context = (
+            ECHO_SIGNATURE_INSTRUCTION
+            + "\n" 
+            + f"Function name: {needle_name}"
+            + "\n"
+            # code_context would go here but we skip it
+            + "\n"
+            + ECHO_SIGNATURE_INSTRUCTION
+            + "\n"
+            + f"Function name: {needle_name}"
+        )
+        
+    elif task_type == "find_file":
+        prompt_without_context = (
+            FIND_FILE_INSTRUCTION
+            + "\n"
+            + f"Function name: {needle_name}"
+            + "\n" 
+            # code_context would go here but we skip it
+            + "\n"
+            + FIND_FILE_INSTRUCTION
+            + "\n"
+            + f"Function name: {needle_name}"
+        )
+    else:
+        raise ValueError(f"Unknown task type: {task_type}")
+    
+    return len(tokenizer.tokenize(prompt_without_context))
 
 
 def make_task_id(lang, repo, needle_name):
@@ -1023,15 +1384,33 @@ def evaluate_model(
                         "template": TEMPLATE,
                         "signature": signature,
                     }
+                    
+                    # Calculate prompt overhead tokens and adjust code context size
+                    tokenizer = AutoTokenizer.from_pretrained("codellama/CodeLlama-7b-Instruct-hf")
+                    prompt_overhead_tokens = _calculate_prompt_overhead_tokens(
+                        task_type=task_type,
+                        needle_name=needle["name"], 
+                        needle_description=task["description"],
+                        tokenizer=tokenizer
+                    )
+                    
+                    # Ensure we have enough tokens for code context
+                    adjusted_code_context_size = max(1024, code_context_size - prompt_overhead_tokens)
+                    
+                    # Warn if prompt overhead is very large
+                    if prompt_overhead_tokens > code_context_size * 0.1:  # More than 10% overhead
+                        print(f"⚠️  Warning: Prompt overhead ({prompt_overhead_tokens} tokens) is {prompt_overhead_tokens/code_context_size*100:.1f}% of context window")
+                    
                     code_context_info = make_code_context(
                         needle,
                         file_content_list,
                         position_ratio=position_ratio,
-                        code_context_size=code_context_size,
+                        code_context_size=adjusted_code_context_size,
                         language=lang,
                         clean_comments=clean_ctx_comments,
                         context_type=context_type,
                         repo_name=repo["repo"],
+                        tokenizer=tokenizer,
                     )
                     task.update(code_context_info)
                     tasks.append(task)

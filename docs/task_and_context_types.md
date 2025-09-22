@@ -11,7 +11,8 @@ This document provides a comprehensive guide to the **task types** and **context
 - [Context Processing Types](#-context-processing-types)
   - [Body Context](#body---complete-function-bodies)
   - [Signature Context](#signature---function-signatures-only)
-  - [Optimal Context](#optimal---dynamic-smart-allocation)
+  - [Mixed Context](#mixed---dynamic-smart-allocation)
+  - [Optimal Context](#optimal---fair-token-distribution)
 - [Usage Examples](#-usage-examples)
 - [Performance Characteristics](#-performance-characteristics)
 - [Best Practices](#-best-practices)
@@ -115,7 +116,7 @@ src/config/validator.py
 
 ## 🔧 Context Processing Types
 
-Our modified version of RepoQA offers three context processing approaches, each optimized for different scenarios and token budgets:
+Our modified version of RepoQA offers four context processing approaches, each optimized for different scenarios and token budgets:
 
 ### `body` (original RepoQA) - Complete Function Bodies
 
@@ -163,9 +164,10 @@ def get_database_url(settings: Dict[str, any]) -> Optional[str]:
 
 **Processing Strategy**:
 - Extracts only function and class signatures using tree-sitter AST parsing
+- **Enhanced class method support**: Automatically includes parent class definitions for methods
 - Preserves parameter lists, return types, and decorators
 - Maintains repository structure overview
-- Optimizes for maximum function discovery
+- Optimizes for maximum function discovery with proper class context
 
 **Example Output**:
 ```python
@@ -177,14 +179,14 @@ def initialize_logging(settings: Dict[str, any]) -> None:
 
 # Path: src/database/connection.py
 class DatabaseConnection:
-def connect(self, url: str) -> bool:
-def execute_query(self, query: str) -> List[Dict]:
-def close_connection(self) -> None:
+    def connect(self, url: str) -> bool:
+    def execute_query(self, query: str) -> List[Dict]:
+    def close_connection(self) -> None:
 ```
 
 ---
 
-### `optimal` - Dynamic Smart Allocation
+### `mixed` - Dynamic Smart Allocation
 
 **Purpose**: Intelligently balances between signatures and complete implementations based on function size and available tokens.
 
@@ -197,7 +199,8 @@ def close_connection(self) -> None:
 1. **Dynamic Token Allocation**: Distributes tokens based on function sizes rather than equal distribution
 2. **Smart Prioritization**: Includes complete smaller functions that fit within token budget
 3. **Fallback to Signatures**: Uses signature-only mode for functions too large to include completely
-4. **Context Optimization**: Prioritizes functions closer to the needle (target function)
+4. **Class Method Support**: Methods include parent class definitions for proper context
+5. **Context Optimization**: Prioritizes functions closer to the needle (target function)
 
 **Algorithm**:
 ```python
@@ -228,6 +231,107 @@ def get_database_url(settings: Dict[str, any]) -> Optional[str]:
     db_config = settings["database"]
     # ... complete implementation included
 ```
+
+---
+
+### `optimal` - Fair Token Distribution
+
+**Purpose**: Provides fair token allocation across all functions with intelligent partial function inclusion for maximum context value.
+
+**Characteristics**:
+- **Includes**: Complete small functions + partial implementations of large functions
+- **Best For**: Maximum information density while maintaining function order and fairness
+- **Function Count**: All functions included with optimal token distribution
+- **Token Efficiency**: Highest (95-100% token usage)
+
+**Processing Strategy**:
+1. **Fair Base Allocation**: Distributes token budget equally among all functions
+2. **Spare Token Redistribution**: Unused tokens from small functions are redistributed to large functions
+3. **Partial Function Support**: Large functions get meaningful partial implementations with truncation indicators
+4. * Class Method Support**: Methods automatically include parent class definitions for proper context
+
+**Algorithm**:
+```python
+base_budget_per_function = total_budget / num_functions
+
+# Calculate spare tokens from small functions
+spare_tokens = 0
+for func in functions:
+    if func_size <= base_budget_per_function:
+        spare_tokens += (base_budget_per_function - func_size)
+
+# Redistribute spare tokens to large functions
+extra_tokens_per_large = spare_tokens / num_large_functions
+for func in functions:
+    if func_size <= base_budget_per_function:
+        include_complete_function(func)
+    else:
+        available_tokens = base_budget_per_function + extra_tokens_per_large
+        include_partial_function(func, available_tokens)
+```
+
+**Example Output**:
+```python
+# Path: src/config/validator.py
+def parse_configuration(config_path: str) -> Dict[str, any]:
+    """Parse configuration file and return settings."""
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        return config
+    except FileNotFoundError:
+        return {"error": "Configuration file not found"}
+    # ... (truncated)
+
+def validate_settings(settings: Dict[str, any]) -> bool:
+    """Validate configuration settings."""
+    required_keys = ["database", "api", "logging"]
+    return all(key in settings for key in required_keys)
+
+def get_database_url(settings: Dict[str, any]) -> Optional[str]:
+    """Extract database URL from settings."""
+    if "database" not in settings:
+        return None
+    db_config = settings["database"]
+    if not all(k in db_config for k in ["host", "port", "name"]):
+        return None
+    # ... (truncated)
+```
+
+---
+
+## 🏗️ Enhanced Class Method Support
+
+All context processing types now include **enhanced class method support** that automatically provides proper class context for methods:
+
+### Key Features
+
+1. **Automatic Class Detection**: Uses tree-sitter AST parsing to detect when functions are methods within classes
+2. **Parent Class Context**: Methods automatically include their parent class definition for proper understanding
+3. **Proper Indentation**: Method signatures are correctly indented within their class context
+4. **Cross-Context Consistency**: Class method enhancement works across all context types (body, signature, mixed, optimal)
+
+### Example Enhancement
+
+**Before Enhancement** (methods without class context):
+```python
+def validate_user(self, user_data: Dict) -> bool:
+def save_user(self, user: User) -> None:
+```
+
+**After Enhancement** (methods with class context):
+```python
+class UserManager:
+    def validate_user(self, user_data: Dict) -> bool:
+    def save_user(self, user: User) -> None:
+```
+
+### Benefits
+
+- **Better Context Understanding**: Models can better understand method relationships and class structure
+- **Improved Code Comprehension**: Class context helps models understand the purpose and scope of methods
+- **Enhanced Signature Clarity**: Method signatures are more meaningful when shown with their class context
+- **Consistent Behavior**: All context types provide the same enhanced class method support
 
 ---
 
@@ -313,7 +417,55 @@ evaluate_model(
 
 ---
 
-## 📊 Performance Characteristics
+## � Technical Implementation Details
+
+### Enhanced Function Extraction
+
+The RepoQA system uses advanced tree-sitter AST parsing to extract functions with enhanced context awareness:
+
+```python
+def _extract_functions_from_content(language: str, content: str):
+    """Extract all functions with class context for methods."""
+    # Uses tree-sitter to parse code into AST
+    # Detects parent classes for methods
+    # Creates enhanced signatures with class context
+    # Preserves original function boundaries and metadata
+```
+
+### Key Implementation Features
+
+1. **Tree-sitter AST Parsing**: Uses language-specific parsers for accurate code structure analysis
+2. **Parent Class Detection**: Automatically traverses AST to find parent class nodes for methods
+3. **Enhanced Signature Generation**: Creates context-aware signatures that include class definitions
+4. **Metadata Preservation**: Maintains function boundaries, byte positions, and classification (method vs function)
+
+### Context Processing Pipeline
+
+```python
+# 1. Extract all functions with enhanced context
+functions = _extract_functions_from_content(language, content)
+
+# 2. Apply context-specific processing
+if context_type == "signature":
+    # Group methods by class to avoid duplicate class definitions
+    # Create optimized signature representations
+elif context_type == "mixed":
+    # Binary decision: complete functions OR signatures only
+    # Enhanced class method handling in both modes
+elif context_type == "optimal":
+    # Fair token distribution with partial function support
+    # Class method enhancement for both complete and partial functions
+```
+
+### Token Efficiency Optimizations
+
+- **Smart Class Grouping**: In signature context, methods are grouped by class to avoid duplicate class definitions
+- **Enhanced Token Allocation**: Class context is included in token calculations for accurate budgeting
+- **Consistent Enhancement**: All context types benefit from the same class method enhancement logic
+
+---
+
+## �📊 Performance Characteristics
 
 ### Token Efficiency Comparison
 
@@ -321,21 +473,22 @@ evaluate_model(
 |--------------|-------------------|------------------|---------------------|
 | **Body**     | 90-100%          | Low (2-5 functions) | Complete implementations |
 | **Signature** | 50-70%           | High (10-20 functions) | Signatures only |
-| **Optimal**  | 85-100%          | Medium (5-12 functions) | Mixed (complete + signatures) |
+| **Mixed**    | 85-100%          | Medium (5-12 functions) | Mixed (complete + signatures) |
+| **Optimal**  | 95-100%          | High (all functions) | Fair partial + complete |
 
 ### Task Type Suitability
 
 | Task Type | Best Context Type | Reasoning |
 |-----------|------------------|-----------|
-| **needle_search** | `optimal` or `body` | Needs function implementations to understand behavior |
-| **echo_signature** | `signature` or `optimal` | Only needs signatures, maximize coverage |
+| **needle_search** | `optimal` or `mixed` or `body` | Needs function implementations to understand behavior |
+| **echo_signature** | `signature` or `optimal` | Only needs signatures, maximize coverage |  
 | **find_file** | `signature` or `optimal` | File navigation benefits from broad repository view |
 
 ### Computational Performance
 
-- **Processing Time**: `signature` < `optimal` < `body`
-- **Memory Usage**: `signature` < `optimal` < `body`
-- **Token Generation**: `signature` (lowest) < `optimal` < `body` (highest)
+- **Processing Time**: `signature` < `mixed` < `optimal` < `body`
+- **Memory Usage**: `signature` < `mixed` < `optimal` < `body`
+- **Token Generation**: `signature` (lowest) < `mixed` < `optimal` < `body` (highest)
 
 ---
 
@@ -353,10 +506,17 @@ evaluate_model(
    - Token budget is limited (<16k tokens)
    - Task focuses on function discovery/navigation
 
-3. **Use `optimal` when**:
+3. **Use `mixed` when**:
    - You want balanced coverage and depth
    - Token budget is moderate (16k-32k tokens)
-   - General-purpose evaluation (recommended default)
+   - General-purpose evaluation
+
+4. **Use `optimal` when**:
+   - You want maximum information density
+   - You need fair representation of all functions
+   - You want consistent function ordering across context types
+   - You want enhanced class method support with proper context
+   - Token budget allows for meaningful partial functions (recommended default)
 
 ### Task Type Selection
 
