@@ -18,15 +18,24 @@ def make_request(
     max_tokens: int = 512,
     temperature: float = 1,
     system_msg="You are a helpful assistant good at coding.",
+    top_p: float = 1.0,
+    top_k: int = -1,
     **kwargs,
 ) -> Message:
-    return client.messages.create(
-        model=model,
-        messages=construct_message_list(message, system_message=system_msg),
-        max_tokens=max_tokens,
-        temperature=temperature,
-        **kwargs,
-    )
+    # Build parameters with supported Anthropic parameters
+    api_params = {
+        "model": model,
+        "messages": construct_message_list(message, system_message=system_msg),
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    
+    if top_p != 1.0:
+        api_params["top_p"] = top_p
+    if top_k != -1:
+        api_params["top_k"] = top_k
+
+    return client.messages.create(**api_params, **kwargs)
 
 
 def handler(signum, frame):

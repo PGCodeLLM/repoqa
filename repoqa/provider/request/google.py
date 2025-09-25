@@ -19,17 +19,29 @@ def make_request(
     temperature: float = 1,
     n: int = 1,
     system_msg="You are a helpful assistant good at coding.",
+    top_p: float = 1.0,
+    top_k: int = -1,
     **kwargs,
 ) -> genai.types.GenerateContentResponse:
     messages = []
     if system_msg:
         messages.append({"role": "system", "parts": [system_msg]})
     messages.append({"role": "user", "parts": [message]})
+    # Build generation config with supported parameters
+    gen_config_params = {
+        "candidate_count": n,
+        "max_output_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    
+    if top_p != 1.0:
+        gen_config_params["top_p"] = top_p
+    if top_k != -1:
+        gen_config_params["top_k"] = top_k
+
     return client.generate_content(
         messages,
-        generation_config=genai.types.GenerationConfig(
-            candidate_count=n, max_output_tokens=max_tokens, temperature=temperature
-        ),
+        generation_config=genai.types.GenerationConfig(**gen_config_params),
         **kwargs,
     )
 
