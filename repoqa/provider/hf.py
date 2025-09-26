@@ -28,7 +28,10 @@ class HfProvider(BaseProvider):
 
     @torch.inference_mode()
     def generate_reply(
-        self, question, n=1, max_tokens=1024, temperature=0.0, system_msg=None
+        self, question, n=1, max_tokens=1024, temperature=0.0,
+        top_p=1.0, top_k=-1, repetition_penalty=1.0, 
+        presence_penalty=0.0, frequency_penalty=0.0,
+        system_msg=None
     ) -> List[str]:
         assert temperature != 0 or n == 1, "n must be 1 when temperature is 0"
 
@@ -39,10 +42,29 @@ class HfProvider(BaseProvider):
         ).cuda()
         input_length = prompt_tokens.size(-1)
 
+        # HuggingFace supports all parameters
         gen_args = {"do_sample": False}
         if temperature > 0:
             gen_args["do_sample"] = True
             gen_args["temperature"] = temperature
+            
+        if top_p != 1.0:
+            gen_args["do_sample"] = True
+            gen_args["top_p"] = top_p
+            
+        if top_k != -1:
+            gen_args["do_sample"] = True
+            gen_args["top_k"] = top_k
+            
+        if repetition_penalty != 1.0:
+            gen_args["repetition_penalty"] = repetition_penalty
+            
+        # Note: HuggingFace transformers doesn't directly support presence_penalty/frequency_penalty
+        # but we can use repetition_penalty for similar effect
+        if presence_penalty != 0.0 or frequency_penalty != 0.0:
+            # Use repetition_penalty as a proxy for presence/frequency penalty
+            combined_penalty = 1.0 + abs(presence_penalty) + abs(frequency_penalty)
+            gen_args["repetition_penalty"] = max(gen_args.get("repetition_penalty", 1.0), combined_penalty)
 
         output_text = self.hf_model.generate(
             input_ids=prompt_tokens,

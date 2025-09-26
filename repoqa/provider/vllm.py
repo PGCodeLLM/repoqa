@@ -29,7 +29,10 @@ class VllmProvider(BaseProvider):
             self.stop_seq.append(hacky_assistant_stop_seq(self.tokenizer))
 
     def generate_reply(
-        self, question, n=1, max_tokens=1024, temperature=0.0, system_msg=None
+        self, question, n=1, max_tokens=1024, temperature=0.0,
+        top_p=1.0, top_k=-1, repetition_penalty=1.0, 
+        presence_penalty=0.0, frequency_penalty=0.0,
+        system_msg=None
     ) -> List[str]:
         assert temperature != 0 or n == 1, "n must be 1 when temperature is 0"
 
@@ -38,13 +41,21 @@ class VllmProvider(BaseProvider):
             tokenize=False,
             add_generation_prompt=True,
         )
+        # VLLM supports all parameters
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k if top_k != -1 else None,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            stop=self.stop_seq,
+        )
+
         vllm_outputs = self.llm.generate(
             [prompt],
-            SamplingParams(
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stop=self.stop_seq,
-            ),
+            sampling_params,
             use_tqdm=False,
         )
 

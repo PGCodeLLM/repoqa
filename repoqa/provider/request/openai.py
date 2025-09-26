@@ -19,16 +19,28 @@ def make_request(
     temperature: float = 1,
     n: int = 1,
     system_msg="You are a helpful assistant good at coding.",
+    top_p: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
     **kwargs,
 ) -> ChatCompletion:
-    return client.chat.completions.create(
-        model=model,
-        messages=construct_message_list(message, system_message=system_msg),
-        max_tokens=max_tokens,
-        temperature=temperature,
-        n=n,
-        **kwargs,
-    )
+    # Build parameters with supported OpenAI parameters
+    api_params = {
+        "model": model,
+        "messages": construct_message_list(message, system_message=system_msg),
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "n": n,
+    }
+    
+    if top_p != 1.0:
+        api_params["top_p"] = top_p
+    if presence_penalty != 0.0:
+        api_params["presence_penalty"] = presence_penalty
+    if frequency_penalty != 0.0:
+        api_params["frequency_penalty"] = frequency_penalty
+
+    return client.chat.completions.create(**api_params, **kwargs)
 
 
 def handler(signum, frame):

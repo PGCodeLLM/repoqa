@@ -162,6 +162,20 @@ repoqa.search_needle_function --model "gemini-1.5-pro-latest" --backend google
   - `--eval-ignore-comments` (default: False): During evaluation, ignore groundtruth and model comments
   - `--trust-remote-code` (default: False): allow remote code (for HuggingFace transformers and vLLM)
   - `--attn-implementation` (default: None): Use "flash_attention_2" if your HF hits OOM
+  
+  **Model Hyperparameters**:
+  - `--temperature` (default: 0.0): Sampling temperature (0.0-2.0). Higher values increase randomness
+  - `--top-p` (default: 1.0): Nucleus sampling parameter (0.0-1.0). Lower values focus on more probable tokens
+  - `--top-k` (default: -1): Top-k sampling parameter (-1 to disable, positive integer otherwise)
+  - `--repetition-penalty` (default: 1.0): Repetition penalty (≥0.0). Values > 1.0 discourage repetition
+  - `--presence-penalty` (default: 0.0): Presence penalty (-2.0 to 2.0). Positive values discourage repeating tokens
+  - `--frequency-penalty` (default: 0.0): Frequency penalty (-2.0 to 2.0). Positive values discourage frequent tokens
+  
+  **Provider Support**:
+  - **OpenAI**: `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`
+  - **Anthropic**: `temperature`, `top_p`, `top_k`
+  - **Google**: `temperature`, `top_p`, `top_k`
+  - **VLLM/HuggingFace**: All parameters supported
 - **Output**:
   - `results/ntoken_{code-context-size}/{model}.jsonl`: Model generated outputs
   - `results/ntoken_{code-context-size}/{model}-SCORE.json`: Evaluation results
