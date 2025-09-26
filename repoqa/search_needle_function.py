@@ -570,8 +570,8 @@ def evaluate_model(
         )
 
     # makedir if not exists
-    os.makedirs(os.path.join(result_dir, task_type), exist_ok=True)
-    context_size_dir = os.path.join(result_dir, task_type, f"ntoken_{code_context_size}_{context_type}")
+    os.makedirs(os.path.join(result_dir, task_type, context_type), exist_ok=True)
+    context_size_dir = os.path.join(result_dir, task_type, context_type, f"ntoken_{code_context_size}")
     os.makedirs(context_size_dir, exist_ok=True)
     model_output_path = os.path.join(
         context_size_dir,
@@ -598,9 +598,9 @@ def evaluate_model(
     if clean_ctx_comments != CleanComment.NoClean:
         extra += "_clean_cmt"
     cache_file = os.path.join(
-        CACHE_DIR, task_type, f"cache{extra}_ntoken_{code_context_size}_{context_type}_v1.jsonl"
+        CACHE_DIR, task_type, context_type, f"cache{extra}_ntoken_{code_context_size}_v1.jsonl"
     )
-    os.makedirs(os.path.join(CACHE_DIR, task_type), exist_ok=True)
+    os.makedirs(os.path.join(CACHE_DIR, task_type, context_type), exist_ok=True)
 
     cache = {}
     if caching:
